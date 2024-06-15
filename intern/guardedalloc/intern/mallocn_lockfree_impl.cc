@@ -8,6 +8,7 @@
  * Memory allocation which keeps track on allocated memory counters
  */
 
+#include <ctime>
 #include <stdarg.h>
 #include <stdio.h> /* printf */
 #include <stdlib.h>
@@ -27,6 +28,7 @@
 
 #include "atomic_ops.h"
 #include "mallocn_intern.h"
+#include <execinfo.h>
 
 typedef struct MemHead {
   /* Length of allocated memory block. */
@@ -55,6 +57,95 @@ enum {
 #define MEMHEAD_ALIGNED_FROM_PTR(ptr) (((MemHeadAligned *)ptr) - 1)
 #define MEMHEAD_IS_ALIGNED(memhead) ((memhead)->len & size_t(MEMHEAD_ALIGN_FLAG))
 #define MEMHEAD_LEN(memhead) ((memhead)->len & ~size_t(MEMHEAD_ALIGN_FLAG))
+#define MAX_LOG_LINES 1000
+#define MIN_SIZE_LOGGED 100
+#define BACKTRACE_SIZE 20
+
+char *get_current_timestamp()
+{
+  time_t currentTime = time(NULL);
+  struct tm *localTime = localtime(&currentTime);
+  char *timestamp = (char *)malloc(20 * sizeof(char));
+  if (timestamp != NULL) {
+    strftime(timestamp, 20, "%Y-%m-%d %H:%M:%S", localTime);
+  }
+  return timestamp;
+}
+
+char *get_backtrace()
+{
+  void *trace_array[BACKTRACE_SIZE];
+  char **strings;
+  int size, i;
+  size_t total_length = 0;
+  char *concatenated;
+
+  size = backtrace(trace_array, BACKTRACE_SIZE);
+  strings = backtrace_symbols(trace_array, size);
+  if (strings != NULL) {
+    for (i = 0; i < size; i++) {
+      total_length += strlen(strings[i]) + 1;  // +1 for the '>' or null terminator
+    }
+
+    concatenated = (char *)malloc(total_length);
+    if (concatenated == NULL) {
+      perror("malloc");
+      free(strings);
+    }
+
+    concatenated[0] = '\0';
+    for (i = 0; i < size; i++) {
+      strcat(concatenated, strings[i]);
+      if (i < size - 1) {
+        strcat(concatenated, ">");
+      }
+    }
+
+    free(strings);
+  }
+
+  return concatenated;
+}
+
+void log(void *ptr, size_t len, const char *fileName)
+{
+  if (len < MIN_SIZE_LOGGED)
+    return;
+
+  FILE *logFile = fopen(fileName, "a");
+  if (logFile) {
+    int lineCount = 0;
+    char ch;
+    while ((ch = static_cast<char>(fgetc(logFile))) != EOF) {
+      if (ch == '\n') {
+        lineCount++;
+        if (lineCount >= MAX_LOG_LINES) {
+          fclose(logFile);
+          return;
+        }
+      }
+    }
+
+    char *timestamp = get_current_timestamp();
+    char *backtrace = get_backtrace();
+
+    fprintf(logFile, "%p, %s, %zu, %s\n", ptr, timestamp, len, backtrace);
+
+    fclose(logFile);
+    free(timestamp);
+    free(backtrace);
+  }
+}
+
+void log_allocation(void *ptr, size_t len)
+{
+  log(ptr, len, "allocations.txt");
+}
+
+void log_deallocation(void *ptr, size_t len)
+{
+  log(ptr, len, "deallocations.txt");
+}
 
 #ifdef __GNUC__
 __attribute__((format(printf, 1, 2)))
@@ -112,6 +203,7 @@ void MEM_lockfree_freeN(void *vmemh)
   }
   else {
     free(memh);
+    log_deallocation(memh, len);
   }
 }
 
@@ -223,7 +315,11 @@ void *MEM_lockfree_callocN(size_t len, const char *str)
     memh->len = len;
     memory_usage_block_alloc(len);
 
-    return PTR_FROM_MEMHEAD(memh);
+    void *ptr = PTR_FROM_MEMHEAD(memh);
+
+    log_allocation(ptr, len);
+
+    return ptr;
   }
   print_error("Calloc returns null: len=" SIZET_FORMAT " in %s, total " SIZET_FORMAT "\n",
               SIZET_ARG(len),
